@@ -1,0 +1,36 @@
+{
+  "base_url": "http://YOUR-HOST/train/",
+  "account": {
+    "code": "",
+    "pwd": ""
+  },
+  "practice": {
+    "qbase_type": 4,
+    "level": 0,
+    "tag_id": -1,
+    "min_dwell_seconds": 100,
+    "max_submit_retry": 12,
+    "resume_pending": true,
+    "synthesize_key_events": true
+  },
+  "loop": {
+    "papers": 1,
+    "sleep_between_seconds": 45,
+    "jitter_seconds": 20,
+    "stop_on_no_new": true
+  },
+  "llm": {
+    "enabled": false,
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "api_key": "",
+    "model": "glm-4-flash",
+    "temperature": 0.2,
+    "timeout": 180
+  },
+  "safety": {
+    "auto_learn_right_answer": false,
+    "skip_unanswered": false,
+    "captcha_ocr": true,
+    "max_papers_per_hour": 10
+  }
+}

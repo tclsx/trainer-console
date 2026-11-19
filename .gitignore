@@ -1,0 +1,8 @@
+.venv/
+.state/
+config.json
+__pycache__/
+*.pyc
+*.exe
+*.log
+dist/
