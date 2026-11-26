@@ -597,15 +597,21 @@ PRACTICE_INT_FIELDS = {
     "sleep_between_seconds": ("loop", 0, 3600),
     "jitter_seconds": ("loop", 0, 600),
     "max_papers_per_hour": ("safety", 0, 100),
+    "auto_fix_attempts": ("practice", 0, 5),
+    "verify_retries": ("practice", 1, 8),
 }
 PRACTICE_BOOL_FIELDS = {
     "stop_on_no_new": "loop",
     "captcha_ocr": "safety",
     "resume_pending": "practice",
+    "auto_fix": "practice",
 }
 
 # 三档预设：动节奏与开关，不动题型与份数。套用后是一套完整状态。
-_PRESET_BOOLS = {"stop_on_no_new": True, "captcha_ocr": True, "resume_pending": True}
+_PRESET_BOOLS = {
+    "stop_on_no_new": True, "captcha_ocr": True,
+    "resume_pending": True, "auto_fix": True,
+}
 PRESETS = {
     "safe": {  # 稳妥：慢一点，风控最宽松
         "min_dwell_seconds": 180,
@@ -632,6 +638,9 @@ PRESETS = {
         **_PRESET_BOOLS,
     },
 }
+for _p in PRESETS.values():
+    _p.setdefault("auto_fix_attempts", 2)
+    _p.setdefault("verify_retries", 3)
 
 
 def practice_payload(cfg: dict | None = None) -> dict:
@@ -648,6 +657,9 @@ def practice_payload(cfg: dict | None = None) -> dict:
         "stop_on_no_new": bool(lp.get("stop_on_no_new", True)),
         "captcha_ocr": bool(sf.get("captcha_ocr", True)),
         "resume_pending": bool(p.get("resume_pending", True)),
+        "auto_fix": bool(p.get("auto_fix", True)),
+        "auto_fix_attempts": int(p.get("auto_fix_attempts", 2) or 0),
+        "verify_retries": int(p.get("verify_retries", 3) or 1),
         # 上次的选择，窗口打开时回填
         "qbase_type": int(p.get("qbase_type", 4) if p.get("qbase_type") is not None else 4),
         "level": int(p.get("level", 0) if p.get("level") is not None else 0),
@@ -958,6 +970,13 @@ label.mode.on{border-color:var(--blue);background:var(--blue-weak)}
         <div class="row" style="gap:16px">
           <label title="遇到「没有新题/额度用完」就停，而不是继续空转"><input type="checkbox" id="p-stopnew"> 无新题即停</label>
           <label title="交卷遇到数字验证码时自动识别，识别失败会弹窗让你手输"><input type="checkbox" id="p-ocr"> 验证码自动识别</label>
+          <label title="低分自动拿判卷真实用例改写、本地 gcc 验证后重做；这是压低 0 分的核心开关"><input type="checkbox" id="p-autofix"> 低分自动修复</label>
+        </div>
+        <div class="row">
+          <label title="低分卷最多自动重做几次">重做次数</label>
+          <input type="number" id="p-fixattempts" min="0" max="5" title="0 表示不自动重做">
+          <label title="每次修复在本地按判卷用例跑通的最大次数">本地验证次数</label>
+          <input type="number" id="p-verifyretries" min="1" max="8">
         </div>
         <div class="row" style="margin-top:6px">
           <button class="ghost small" id="btn-save-practice">保存策略</button>
@@ -1434,6 +1453,9 @@ function fillPractice(p) {
   $('p-perhour').value = p.max_papers_per_hour;
   $('p-stopnew').checked = !!p.stop_on_no_new;
   $('p-ocr').checked = !!p.captcha_ocr;
+  $('p-autofix').checked = !!p.auto_fix;
+  $('p-fixattempts').value = p.auto_fix_attempts;
+  $('p-verifyretries').value = p.verify_retries;
   if (p.qbase_type != null) $('type').value = String(p.qbase_type);
   if (p.level != null) $('level').value = String(p.level);
   if (p.tag_id != null) { ensureTagOption(p.tag_id); $('tag').value = String(p.tag_id); }
@@ -1456,6 +1478,9 @@ $('btn-save-practice').onclick = async () => {
     max_papers_per_hour: parseInt($('p-perhour').value) || 0,
     stop_on_no_new: $('p-stopnew').checked,
     captcha_ocr: $('p-ocr').checked,
+    auto_fix: $('p-autofix').checked,
+    auto_fix_attempts: parseInt($('p-fixattempts').value) || 0,
+    verify_retries: parseInt($('p-verifyretries').value) || 1,
   };
   practiceMsg(await api('/api/practice', body));
 };

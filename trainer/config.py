@@ -22,6 +22,11 @@ DEFAULTS = {
         "min_dwell_seconds": 100,
         "max_submit_retry": 12,
         "resume_pending": True,
+        # 低分自动修复：拿判卷真实用例 → 本地 gcc 跑通 → 入库 → reanswer 重交。
+        # 这是把「偶尔 0 分」压到最低的核心开关，默认开。
+        "auto_fix": True,
+        "auto_fix_attempts": 2,
+        "verify_retries": 3,
     },
     "loop": {
         "papers": 3,

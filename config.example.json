@@ -11,7 +11,10 @@
     "min_dwell_seconds": 100,
     "max_submit_retry": 12,
     "resume_pending": true,
-    "synthesize_key_events": true
+    "synthesize_key_events": true,
+    "auto_fix": true,
+    "auto_fix_attempts": 2,
+    "verify_retries": 3
   },
   "loop": {
     "papers": 1,

@@ -8,9 +8,10 @@ import time
 from datetime import datetime
 
 from . import bank as bank_mod
+from . import verify as verify_mod
 from .api import ApiError, NeedCaptcha, TooFast, TrainerAPI
 from .captcha import CaptchaSolver
-from .config import CHOOSE_Q, POST_ANSWER, QBASE_TYPES
+from .config import CHOOSE_Q, POST_ANSWER, QBASE_TYPES, LANGUAGE_BY_ID
 from .solver import Solver, TYPE_NAME, _slot_map, parse_questions
 
 
@@ -183,7 +184,7 @@ class Runner:
 
         return self._answer_and_submit(sid, rec, started, stats, rows)
 
-    def _answer_and_submit(self, sid, rec, started=None, stats=None, rows=None) -> dict:
+    def _answer_and_submit(self, sid, rec, started=None, stats=None, rows=None, fix_attempt: int = 0) -> dict:
         started = started or self._server_started_epoch(rec) or time.time()
         # 安全闸：一条有效答案都没有（LLM 未启用 + 题库未命中）就别交卷，
         # 交空卷会白占一次额度，且退出后还得不回来。
@@ -239,8 +240,20 @@ class Runner:
         self.store.finish_paper(sid, state=state, score=score, total=total, note=note)
         log(f"已交卷：状态={state} 得分={score}/{total}", "★")
         if score is not None and total and score < total:
-            log(f"低分卷：run.py diagnose --sid {sid} 看判卷真实用例，改答案入库后 run.py redo {sid}", "!")
+            log(f"低分卷：{score}/{total}（可 run.py diagnose --sid {sid} 看判卷真实用例）", "!")
             self._warn_empty_expected(sid)
+            practice = self.cfg.get("practice") or {}
+            if practice.get("auto_fix", True):
+                try:
+                    max_attempts = max(1, int(practice.get("auto_fix_attempts", 2)))
+                except (TypeError, ValueError):
+                    max_attempts = 2
+                if fix_attempt < max_attempts:
+                    fixed = self._auto_fix(sid, rec, fix_attempt, max_attempts)
+                    if fixed:
+                        return fixed
+                else:
+                    log(f"已自动修复 {fix_attempt} 次仍未满分，停止重试，保留成绩", "!")
 
         # 默认不学：实测**任何时机**调用 right-answer-paper 都会让该卷无法 reanswer
         # （未交卷→post-answer=6；已交卷→reanswer=0）。只在明确开启且本卷满分时才学。
@@ -303,6 +316,88 @@ class Runner:
                 log(f"交卷出错：{e}", "!")
                 time.sleep(3)
         return False
+
+    # ---------------- 低分自动修复 ----------------
+    def _auto_fix(self, sid, rec, attempt: int, max_attempts: int) -> dict | None:
+        """拿判卷真实用例 → 本地跑通 → 入库 → reanswer 重交。
+
+        实测 0 分几乎都是「差一个字符/边界」：初始项、循环范围、尾随换行、宽度。
+        这里把 failedTestCase 的真实 input/expected/actual 交给模型改，再用 gcc 本地跑通，
+        通过后才写进题库并重开这份卷子重新提交。
+        """
+        try:
+            data = self.api.score_result(sid)
+        except ApiError:
+            return None
+
+        questions = {str(q["globalId"]): q for q in parse_questions(rec)}
+        slots = _slot_map(rec)
+        changed = 0
+        for gid, q in questions.items():
+            cases = verify_mod.cases_from_score(data, gid)
+            if not cases:
+                continue
+            hit = slots.get(gid)
+            if not hit or hit[0] != 4:  # 只自动修编程题；客观题没有可执行代码可修
+                continue
+            wrong = hit[1].get("answer") or ""
+            if not isinstance(wrong, str) or not wrong.strip():
+                continue
+            log(f"自动修复 {gid[:8]}：拿到 {len(cases)} 条真实判卷用例，开始改写", "!")
+            try:
+                fixed = self.solver.fix_code(q, wrong, cases)
+            except Exception as exc:  # noqa: BLE001
+                log(f"自动修复 {gid[:8]} 失败：{type(exc).__name__}: {exc}", "!")
+                continue
+            if not fixed or fixed == wrong:
+                log(f"自动修复 {gid[:8]}：模型没给出不同答案，跳过", "!")
+                continue
+            lang = LANGUAGE_BY_ID.get(q["language"], "cpp")
+            passed, details = verify_mod.verify_code(fixed, lang, cases)
+            if not passed:
+                log(f"自动修复 {gid[:8]}：本地仍未跑通，先入库让平台判（详情见日志）", "!")
+                for d in details:
+                    log(f"    {d[:200]}", "!")
+            else:
+                log(f"自动修复 {gid[:8]}：本地用例全部通过", "✓")
+            h = bank_mod.qhash(4, q["content"], q["options"])
+            self.store.put_answer(h, 4, q["content"], fixed, "auto-fix")
+            changed += 1
+
+        if not changed:
+            return None
+        if STOP.is_set():
+            log("收到停止请求，不再自动重做低分卷", "■")
+            return None
+        try:
+            ret = self.api.reanswer(sid)
+        except ApiError as exc:
+            log(f"自动重做失败：reanswer 异常 {exc}", "!")
+            return None
+        if ret != 1:
+            log(
+                f"reanswer 返回 {ret}：本卷无法重开（可能超时或已看答案）；"
+                "修好的答案已入库，下次遇到同题会用新答案",
+                "!",
+            )
+            return None
+        try:
+            rec2 = self.api.record(sid)
+        except ApiError as exc:
+            log(f"重开后取卷失败：{exc}", "!")
+            return None
+        if int(rec2.get("state", 0)) != 0:
+            log(f"重开后状态={rec2.get('state')}，不重做", "!")
+            return None
+        rows, stats = self.solver.solve(rec2)
+        if stats.get("error"):
+            log(f"重做解题失败：{stats['error']}", "!")
+            return None
+        log(f"第 {attempt + 1}/{max_attempts} 次自动重做开始（修好的答案已入库）", "↻")
+        return self._answer_and_submit(
+            sid, rec2, started=time.time(), stats=stats, rows=rows,
+            fix_attempt=attempt + 1,
+        )
 
     # ---------------- 分数 ----------------
     def _warn_empty_expected(self, sid) -> None:

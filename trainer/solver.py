@@ -18,6 +18,7 @@ from . import bank as bank_mod
 from .config import LANGUAGE_BY_ID
 from .keys import code_to_key_sequence
 from .llm import LLMClient, LLMError, extract_code
+from . import verify as verify_mod
 
 TYPE_NAME = {0: "单", 1: "多", 2: "判断", 3: "填空", 4: "编程", 5: "设计"}
 LETTERS = "ABCDEFGH"
@@ -475,6 +476,99 @@ class Solver:
         except LLMError:
             pass
         return code
+
+    def fix_code(self, q: dict, wrong_code: str, cases: list[dict]) -> str:
+        """按判卷真实用例改写代码，并在本地 gcc 跑通后才返回。
+
+        cases 来自 score_result.failedTestCase，含平台真实 input / expected / actual。
+        实测 0 分的主因不是「没思路」，而是初始项、循环边界、尾随换行、格式宽度差一个字符。
+        这里把差异直接喂给模型，再用本地编译运行做闭环，避免同样的错反复交。
+        """
+        lang = LANGUAGE_BY_ID.get(q["language"], "cpp")
+        try:
+            retries = max(1, int(self.cfg.get("practice", {}).get("verify_retries", 3)))
+        except (TypeError, ValueError):
+            retries = 3
+
+        case_blocks = []
+        for i, c in enumerate(cases, 1):
+            case_blocks.append(
+                f"--- 判卷用例 {i} ---\n"
+                f"输入: {c.get('input') or '(空)'!r}\n"
+                f"期望输出: {c.get('expected') or ''!r}\n"
+                f"上次实际输出: {c.get('actual') or ''!r}\n"
+                f"比对方式: {c.get('compareMode') or 'exact'}"
+            )
+        system = (
+            "你是 C 语言自动判卷平台的修复专家。只输出一份完整可编译代码，用 ``` 包裹，"
+            "不要解释、不要标题、不要附多个版本。"
+        )
+        user = (
+            f"编程语言：{lang}\n"
+            f"原题：\n{q['content']}\n\n"
+            f"上次交的代码（0 分）：\n```\n{wrong_code}\n```\n\n"
+            "平台判卷的真实用例如下，期望输出是逐字符标准（含空格、换行、标点）：\n"
+            + "\n\n".join(case_blocks)
+            + "\n\n"
+            "修复规则（违反任意一条仍会 0 分）：\n"
+            "1. 平台是 exact 逐字符比对，末尾换行也算字符。若期望串最后一个字符不是 `\\n`，"
+            "最后一行就绝不能输出换行：改成「每行前先打印换行符，再打印本行」。\n"
+            "2. 输出行数、循环范围、首项必须与期望完全一致。实测高频坑：\n"
+            "   - e 近似值要从 count=1、e=1.00000000 开始打印，且包含最后一项小于阈值的那次；\n"
+            "   - 回文素数题通常排除 2/3/5/7 这类个位数，从 10 或 11 开始；\n"
+            "   - 百钱百鸡类问题男人从 1 开始、到 9 结束，不要输出 x=0 或 x=10；\n"
+            "   - 九九表区分上三角/下三角；表头、分隔行、是否空行、%4d 还是 %5d 都要对齐期望；\n"
+            "   - 等差数列题不要只打印前四项，要一直打印到期望里最后一项。\n"
+            "3. 禁止 sscanf；有输入提示信息时先 scanf 读完输入，再打印提示符，别在循环末尾重复打印。\n"
+            "4. 题目文字和期望输出冲突时，以期望输出为准。\n"
+            "5. 改错题里输入含字母时别用 %d 去读（遇到字母会失败）；连续用 %c 读字符，"
+            "需要跳过换行/空白时写成 \" %c\"（百分号前带空格）。\n"
+            "6. 期望里带小数（如 123.300000）时对应变量必须是 float/double，不能用 int 截断；"
+            "unsigned short 65535 赋给 short 会变 -1，要保留 unsigned 或用更大的类型。\n"
+            "7. 交完整源码（含 main），不要注释掉旧代码再附新版本。\n"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        best = wrong_code
+        for attempt in range(retries):
+            try:
+                text = self.llm.chat(messages, max_tokens=3500)
+            except LLMError as exc:
+                print(f"[!] 自动修复模型调用失败：{exc}", flush=True)
+                break
+            code = extract_code(text)
+            if not code or not code.strip():
+                messages += [
+                    {"role": "assistant", "content": text},
+                    {"role": "user", "content": "输出为空。请只输出一份用 ``` 包裹的完整代码。"},
+                ]
+                continue
+            ok, err = _check_code(code, lang)
+            if not ok:
+                messages += [
+                    {"role": "assistant", "content": text},
+                    {"role": "user", "content": (
+                        f"交卷前自检没通过：{err}\n请修正后重新输出完整代码。"
+                    )},
+                ]
+                continue
+            passed, details = verify_mod.verify_code(code, lang, cases)
+            if passed:
+                print(f"[✓] 本地判卷用例验证通过（第 {attempt + 1} 次修复）", flush=True)
+                return code
+            best = code
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "本地按判卷用例跑过了，仍然不一致：\n"
+                    + "\n".join(details)
+                    + "\n请只输出修正后的完整代码（``` 包裹），下一份要能逐字符匹配期望输出。"
+                )},
+            ]
+        print(f"[!] 自动修复 {retries} 次仍未本地通过，用最后一次结果交平台判", flush=True)
+        return best
 
     def _ask_design(self, q: dict) -> str:
         system = "你是计算机专业助教，回答简洁、分点、给关键代码或伪代码。"
